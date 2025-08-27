@@ -1,0 +1,234 @@
+import time
+from queue import Queue
+from threading import Thread
+from collections import defaultdict
+import traceback
+
+import telebot
+from telebot.apihelper import ApiException
+from telebot.types import ChatPermissions  # <-- добавлено
+
+from entities.delayed_response import DelayedResponseQueue
+from logger import Logger
+from storage import AbstractStorage
+import plugins
+from metrics import BotMetrics
+
+PLUGIN_NEW_CHAT_MESSAGE = 1
+PLUGIN_NEW_CHAT_MEMBER = 2
+
+
+class QueueExit:
+    """Class used to exit from worker threads"""
+    pass
+
+
+class EngineTask:
+    """Class used to execute telegram bot api methods through worker thread using queue"""
+
+    def __init__(
+        self,
+        method_name: str,
+        kwargs: dict,
+        tries: int = 1,
+        max_tries: int = 3,
+        response_queue: DelayedResponseQueue = None,
+    ) -> None:
+        self.method_name: str = method_name
+        self.kwargs: dict = kwargs
+        self.tries: int = tries
+        self.max_tries: int = max_tries
+        self.response_queue: DelayedResponseQueue = response_queue
+
+
+class Engine:
+    """Wrapper for telebot implementing custom logic for event processing"""
+
+    def __init__(
+        self,
+        bot_username: str,
+        bot: telebot.TeleBot,
+        metrics: BotMetrics,
+        storage: AbstractStorage,
+        logger: Logger,
+    ) -> None:
+        self.bot_username = bot_username
+        self._bot = bot
+        self.bot = bot
+        self.api = bot
+        self._metrics = metrics
+        self._storage = storage
+        self._logger = logger
+
+        self._plugins = defaultdict(list)
+        self._msg_queue = Queue()
+        self._reply_queue = Queue(25)
+
+        self._threads = [
+            Thread(target=self._send_message_queue, args=(self._reply_queue,)),
+        ]
+
+        # Регистрация обработчиков
+        self._bot.register_message_handler(
+            self._chat_member_joins, content_types=["new_chat_members"]
+        )
+        self._bot.register_message_handler(self.on_chat_message, content_types=["text"])
+
+    def start(self) -> None:
+        for thread in self._threads:
+            thread.start()
+        self.log("Start polling...")
+        self._bot.infinity_polling()
+
+    def stop(self) -> None:
+        for _ in range(len(self._threads)):
+            self._reply_queue.put(QueueExit)
+        for thread in self._threads:
+            thread.join()
+        self._bot.stop_bot()
+        self.log("Bot stopped")
+
+    @property
+    def storage(self) -> AbstractStorage:
+        return self._storage
+
+    @property
+    def metrics(self) -> BotMetrics:
+        return self._metrics
+
+    def add_callback_query_handler(self, callback: callable, **kwargs) -> None:
+        self._bot.register_callback_query_handler(func=callback, **kwargs)
+
+    def add_plugin(self, plugin) -> None:
+        self._plugins[plugin.plugin_type].append(plugin)
+        self.log(f"Registered plugin: {plugin.__class__.__name__}")
+
+    # --- Методы работы с Telegram ---
+    def send_message(self, reply_to: DelayedResponseQueue = None, **kwargs) -> Queue:
+        task = EngineTask("send_message", kwargs, response_queue=reply_to)
+        self._reply_queue.put(task)
+        return task.response_queue
+
+    def delete_message(self, chat_id, message_id: int) -> None:
+        self._reply_queue.put(
+            EngineTask("delete_message", {"chat_id": chat_id, "message_id": message_id})
+        )
+
+    def kick_chat_member(self, chat_id: int, user_id: int):
+        self._reply_queue.put(
+            EngineTask("kick_chat_member", {"chat_id": chat_id, "user_id": user_id})
+        )
+
+    def ban_user(self, chat_id: int, user_id: int) -> None:
+        self._reply_queue.put(
+            EngineTask("ban_chat_member", {"chat_id": chat_id, "user_id": user_id})
+        )
+
+    def unban_user(self, chat_id: int, user_id: int) -> None:
+        """Разблокировка пользователя"""
+        self._reply_queue.put(
+            EngineTask("unban_chat_member", {"chat_id": chat_id, "user_id": user_id})
+        )
+
+    def mute_user(self, chat_id: int, user_id: int, duration_seconds: int):
+        """Временный мут пользователя"""
+        until_date = int(time.time() + duration_seconds)
+        permissions = ChatPermissions(
+            can_send_messages=False,
+            can_send_media_messages=False,
+            can_send_polls=False,
+            can_send_other_messages=False,
+            can_add_web_page_previews=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False,
+        )
+        self._reply_queue.put(
+            EngineTask(
+                "restrict_chat_member",
+                {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "until_date": until_date,
+                    "permissions": permissions,
+                },
+            )
+        )
+
+    # --- Внутренние методы ---
+    def _send_message_queue(self, queue: Queue):
+        while True:
+            task: EngineTask = queue.get()
+            try:
+                if task == QueueExit:
+                    return
+
+                exec_method = getattr(self._bot, task.method_name)
+                self.log(f"Execing method '{task.method_name}'")
+                response = exec_method(**task.kwargs)
+                if task.response_queue:
+                    task.response_queue.put(response)
+
+                self._metrics.inc_commands_executed_total(
+                    task.method_name, task.kwargs.get("chat_id", 0)
+                )
+            except ApiException as exc:
+                self.log(
+                    f"Unhandled ApiException: {exc}\n{traceback.format_exc()}",
+                    severity="error",
+                )
+            except Exception as exc:
+                self.log(
+                    f"Unhandled Exception: {exc}\n{traceback.format_exc()}", "error"
+                )
+                if task.tries <= task.max_tries:
+                    task.tries += 1
+                    queue.put(task)
+                else:
+                    self.log("Task dropped because max retry limit exceeded")
+            finally:
+                queue.task_done()
+
+    def log(self, msg: str, severity: str = "info") -> None:
+        match severity:
+            case "error":
+                self._logger.error(msg)
+            case _:
+                self._logger.info(msg)
+
+    # --- Обработка событий ---
+    def _chat_member_joins(self, message: telebot.types.Message):
+        self._storage.on_added_to_group(message.chat.id)
+        self._metrics.inc_members_joined_total(message.chat.id, message.from_user.id)
+        self._run_plugins(PLUGIN_NEW_CHAT_MEMBER, message)
+
+    def _run_plugins(self, plugin_type: int, message: telebot.types.Message) -> bool:
+        for plugin in self._plugins[plugin_type]:
+            try:
+                if plugin.execute(self, message):
+                    return True
+            except Exception as exc:
+                cls_name = plugin.__class__.__name__
+                self.log(
+                    f"Unhandled error in plugin {cls_name}:\n{exc}\n{traceback.format_exc()}",
+                    "error",
+                )
+                self._metrics.inc_plugin_errors_total(cls_name, exc.__class__.__name__)
+        return False
+
+    def on_bot_added_to_group(self, group_id: int):
+        self._storage.on_added_to_group(group_id)
+
+    def on_chat_message(self, message):
+        self._storage.on_added_to_group(message.chat.id)
+        self._metrics.inc_messages_received_total(message.chat.id, message.from_user.id)
+
+        if self._run_plugins(PLUGIN_NEW_CHAT_MESSAGE, message):
+            return
+
+        if not self.storage.is_user_confirmed(message.chat.id, message.from_user.id) and \
+           not self.storage.get_user_confirm_code(message.chat.id, message.from_user.id):
+            return
+
+        if not self.storage.is_user_confirmed(message.chat.id, message.from_user.id):
+            self.delete_message(chat_id=message.chat.id, message_id=message.id)
