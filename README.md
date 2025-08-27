@@ -1,5 +1,5 @@
 # antispam-bot for telegram group
-![TAB](https://github.com/nolka/telegram-antispam-bot/blob/readme-rewrite/logo.png?raw=true)
+![TAB](https://github.com/Liliya131/telegram-antispam-bot/blob/main/logo.png)
 ## Description
 Simple telegram antispam bot written in python. Can be used in multiple groups simultaneously.
 ### Main functions:
