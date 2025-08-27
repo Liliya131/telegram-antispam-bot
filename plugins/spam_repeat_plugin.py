@@ -12,7 +12,7 @@ class SpamRepeatPlugin(AbstractPlugin):
         self._last_messages = defaultdict(lambda: defaultdict(list))
         self._warnings = defaultdict(lambda: defaultdict(lambda: {"count": 0, "last_warn": None}))
         self._spam_threshold = spam_threshold
-        self._mute_duration = timedelta(minutes=mute_days)
+        self._mute_duration = timedelta(days=mute_days)
         self._duplicate_window = timedelta(hours=duplicate_window_hours)
         self._warning_reset = timedelta(hours=24)  # сброс через 24 часа
 

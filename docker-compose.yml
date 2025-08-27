@@ -1,8 +1,9 @@
 version: "3.9"
+
 services:
   telegram-bot:
     build: .
     container_name: telegram-bot
     env_file:
-      - .env
+      - .env      # можно убрать на Railway, если используешь Variables
     restart: unless-stopped
