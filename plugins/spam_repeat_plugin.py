@@ -6,7 +6,7 @@ from plugins.base import AbstractPlugin, PLUGIN_NEW_CHAT_MESSAGE
 class SpamRepeatPlugin(AbstractPlugin):
     plugin_type = PLUGIN_NEW_CHAT_MESSAGE
 
-    def __init__(self, logger, engine, spam_threshold=2, mute_days=3, duplicate_window_hours=24):
+    def __init__(self, logger, engine, spam_threshold=1, mute_days=3, duplicate_window_hours=24):
         super().__init__(logger)
         self._engine = engine
         self._last_messages = defaultdict(lambda: defaultdict(list))
